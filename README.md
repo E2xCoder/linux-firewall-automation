@@ -55,6 +55,7 @@ Then choose an option from the menu:
 7 Allow IP  
 8 Reset Firewall  
 9 Exit
+
 <img width="655" height="943" alt="Screenshot 2026-04-04 230738" src="https://github.com/user-attachments/assets/52295456-df50-4a8b-be72-4f68bf55b837" />
 
 ## Learning Outcome
