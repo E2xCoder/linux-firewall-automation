@@ -4,6 +4,7 @@
 python). The interactive menu lives in ``main()`` and only runs when the file
 is executed as a script; importing the module never runs a command.
 """
+import argparse
 import contextlib
 import errno
 import functools
@@ -16,6 +17,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -776,6 +778,53 @@ class FirewallManager:
                 return True
         return False
 
+    @_guarded(False)
+    def reap(self):
+        """Remove expired temporary blocks. True when none are left unremoved."""
+        with self._locked():
+            state = self._load()
+            removed, failed = self._reap_locked(state)
+        if removed or failed:
+            self._log(f"Reap: removed {removed}, failed {failed}")
+        return failed == 0
+
+    @_guarded(False)
+    def start_reaper(self, interval=60.0):
+        """Opt-in background thread that calls reap() every *interval* seconds.
+
+        Never started by the constructor. Prefer the systemd timer or cron
+        entry from the README when the host process is short-lived.
+        """
+        if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+                or not math.isfinite(interval) or interval <= 0):
+            return False
+        if self._reaper is not None and self._reaper.is_alive():
+            return True
+        self._reaper_stop.clear()
+        self._reaper = threading.Thread(
+            target=self._reaper_loop, args=(interval,),
+            name="firewall-reaper", daemon=True)
+        self._reaper.start()
+        return True
+
+    def _reaper_loop(self, interval):
+        while not self._reaper_stop.wait(interval):
+            self.reap()
+
+    @_guarded(False)
+    def stop_reaper(self, timeout=5.0):
+        """Stop the background reaper. True when no reaper thread is running."""
+        self._reaper_stop.set()
+        thread = self._reaper
+        if thread is None:
+            return True
+        if thread is not threading.current_thread():
+            thread.join(timeout)
+        if thread.is_alive():
+            return False
+        self._reaper = None
+        return True
+
     del _guarded
 
 
@@ -795,8 +844,8 @@ MENU = """
 """
 
 
-def main():
-    manager = FirewallManager(interactive=True)
+def run_menu(manager=None):
+    manager = manager or FirewallManager(interactive=True)
     while True:
         print(MENU)
         choice = input("Select: ")
@@ -846,5 +895,31 @@ def main():
             break
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="firewall_manager.py",
+        description="UFW firewall manager. Without options, starts the menu.")
+    parser.add_argument("--reap", action="store_true",
+                        help="remove expired temporary blocks and exit "
+                             "(for a systemd timer or cron)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="update the state file only; run no ufw command")
+    parser.add_argument("--state-dir", help="absolute state directory")
+    parser.add_argument("--state-file", help="state file (absolute, or relative "
+                                             "to the state directory)")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.reap:
+        manager = FirewallManager(state_file=args.state_file,
+                                  state_dir=args.state_dir, dry_run=args.dry_run)
+        return 0 if manager.reap() else 1
+    run_menu(FirewallManager(state_file=args.state_file, state_dir=args.state_dir,
+                             dry_run=args.dry_run, interactive=True))
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
