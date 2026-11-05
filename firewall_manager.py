@@ -4,16 +4,35 @@
 python). The interactive menu lives in ``main()`` and only runs when the file
 is executed as a script; importing the module never runs a command.
 """
+import contextlib
+import errno
+import functools
 import ipaddress
 import json
+import logging
+import math
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-LOG_FILE = "firewall.log"
+try:  # POSIX only; the module must still import elsewhere
+    import fcntl
+except ImportError:  # pragma: no cover - non-Linux
+    fcntl = None
+
+ENV_STATE_DIR = "FIREWALL_AUTOMATION_STATE_DIR"
+DEFAULT_STATE_SUBDIR = Path(".local") / "state" / "firewall-automation"
+DEFAULT_STATE_NAME = "state.json"
+DEFAULT_LOG_NAME = "firewall.log"
+DEFAULT_LOCK_TIMEOUT = 10.0
+MAX_LOG_LINE = 400
+
+_logger = logging.getLogger("firewall_manager")
+_PROCESS_LOCK = threading.Lock()
 
 DEFAULT_UFW_PATH = "/usr/sbin/ufw"
 DEFAULT_COMMAND_TIMEOUT = 15
@@ -28,12 +47,55 @@ _SUDO_PROMPT_MARKERS = (
 )
 
 
-def log_action(action):
+class FirewallError(Exception):
+    """Internal failure; public methods turn it into ``False``."""
+
+
+def sanitize_log(value):
+    """One printable line: control characters (incl. newlines) become '?'."""
+    text = value if isinstance(value, str) else repr(value)
+    text = "".join(ch if ch.isprintable() else "?" for ch in text)
+    if len(text) > MAX_LOG_LINE:
+        text = text[:MAX_LOG_LINE] + "..."
+    return text
+
+
+def _default_state_dir():
+    """Absolute state dir from the environment, else under HOME; None if unusable."""
+    configured = os.environ.get(ENV_STATE_DIR)
+    if configured:
+        path = Path(configured)
+        return path if path.is_absolute() else None
     try:
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{datetime.now()} - {action}\n")
-    except OSError:
+        return Path.home() / DEFAULT_STATE_SUBDIR
+    except (RuntimeError, KeyError, OSError):
+        return None
+
+
+def _write_log(path, message):
+    line = sanitize_log(message)
+    try:
+        _logger.info("%s", line)
+    except Exception:  # noqa: BLE001 - logging must never change a result
         pass
+    if path is None:
+        return
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, f"{datetime.now().isoformat(timespec='seconds')} - {line}\n"
+                     .encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def log_action(action):
+    state_dir = _default_state_dir()
+    _write_log(state_dir / DEFAULT_LOG_NAME if state_dir else None, action)
 
 
 def run_command(command):
@@ -48,12 +110,32 @@ def valid_port(port):
     return False
 
 
-def valid_ip(ip):
+_ADDRESS_CHARS = frozenset("0123456789abcdefABCDEF:./")
+_V4_MAPPED = ipaddress.ip_network("::ffff:0:0/96")
+
+
+def parse_target(value):
+    """Canonical ``ip_network`` for an IPv4/IPv6 address or CIDR, else None.
+
+    Pure format validation: rejects non-strings, whitespace/control characters,
+    zone IDs (``%``), and IPv4-mapped IPv6. Host bits are masked, so
+    ``10.0.0.5/24`` becomes ``10.0.0.0/24``.
+    """
+    if not isinstance(value, str) or not 0 < len(value) <= 64:
+        return None
+    if not set(value) <= _ADDRESS_CHARS:
+        return None
     try:
-        ipaddress.ip_address(ip)
-        return True
+        net = ipaddress.ip_network(value, strict=False)
     except ValueError:
-        return False
+        return None
+    if net.version == 6 and net.overlaps(_V4_MAPPED):
+        return None
+    return net
+
+
+def valid_ip(ip):
+    return parse_target(ip) is not None
 
 
 def enable_firewall():
@@ -148,22 +230,94 @@ class FirewallManager:
     ``sudo -n`` prefix when one is used.
     """
 
-    def __init__(self, state_file="firewall_state.json", dry_run=False,
-                 runner=None, *, ufw_path=DEFAULT_UFW_PATH, use_sudo=None,
-                 command_timeout=DEFAULT_COMMAND_TIMEOUT, interactive=False):
-        self.state_file = Path(state_file)
+    def __init__(self, state_file=None, dry_run=False, runner=None, *,
+                 state_dir=None, log_file=None, ufw_path=DEFAULT_UFW_PATH,
+                 use_sudo=None, command_timeout=DEFAULT_COMMAND_TIMEOUT,
+                 lock_timeout=DEFAULT_LOCK_TIMEOUT, interactive=False):
         self.dry_run = dry_run
         self.ufw_path = ufw_path
         self.command_timeout = command_timeout
+        self.lock_timeout = lock_timeout
         self.interactive = interactive
         self.use_sudo = (not _is_root()) if use_sudo is None else bool(use_sudo)
         self._runner = runner
         self._prepend_ok = None
+        self._clock = time.time
+        self._reaper = None
+        self._reaper_stop = threading.Event()
+        self.state_dir, self.state_file, self.log_file = self._resolve_paths(
+            state_dir, state_file, log_file)
+
+    @staticmethod
+    def _resolve_paths(state_dir, state_file, log_file):
+        """Never raises; an unusable location becomes None (methods then fail)."""
+        try:
+            if state_dir is not None:
+                base = Path(state_dir)
+                base = base if base.is_absolute() else None
+            else:
+                base = _default_state_dir()
+            if state_file is None:
+                state = base / DEFAULT_STATE_NAME if base else None
+            else:
+                state = Path(state_file)
+                if not state.is_absolute():
+                    state = base / state if base else None
+            if log_file is not None:
+                log = Path(log_file)
+            elif base is not None:
+                log = base / DEFAULT_LOG_NAME
+            else:
+                log = state.parent / DEFAULT_LOG_NAME if state else None
+            return base, state, log
+        except Exception:  # noqa: BLE001
+            return None, None, None
 
     # -- logging -----------------------------------------------------------
 
     def _log(self, message):
-        log_action(message)
+        _write_log(self.log_file, message)
+
+    # -- locking -----------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Thread lock plus an flock on ``<state>.lock`` (POSIX)."""
+        path = self.state_file
+        if path is None:
+            raise FirewallError(
+                "no usable state location (HOME unset or state dir not absolute)")
+        deadline = time.monotonic() + self.lock_timeout
+        if not _PROCESS_LOCK.acquire(timeout=self.lock_timeout):
+            raise FirewallError("lock timeout (another thread holds the state lock)")
+        fd = None
+        try:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if fcntl is not None:
+                    fd = os.open(str(path.with_name(path.name + ".lock")),
+                                 os.O_RDWR | os.O_CREAT, 0o600)
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except OSError as exc:
+                            if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                                raise
+                            if time.monotonic() >= deadline:
+                                raise FirewallError(
+                                    "lock timeout (another process holds the state lock)")
+                            time.sleep(0.05)
+            except OSError as exc:
+                raise FirewallError(f"cannot lock state: {exc}") from exc
+            yield
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            _PROCESS_LOCK.release()
 
     # -- command execution -------------------------------------------------
 
@@ -262,19 +416,53 @@ class FirewallManager:
     # -- state -------------------------------------------------------------
 
     def _load(self):
+        """Return {canonical network: expiry or None}. Raises FirewallError."""
         try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            raw = self.state_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return {}
+        except OSError as exc:
+            raise FirewallError(f"cannot read state file: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise FirewallError(
+                "state file is corrupt; refusing to overwrite it") from exc
         if not isinstance(data, dict):
-            return {}
-        return {ip: exp for ip, exp in data.items()
-                if valid_ip(ip) and (exp is None or isinstance(exp, (int, float)))}
+            raise FirewallError("state file is corrupt; refusing to overwrite it")
+        if data.get("version") == 1:
+            blocks = data.get("blocks")
+            if not isinstance(blocks, dict):
+                raise FirewallError("state file is corrupt; refusing to overwrite it")
+        else:  # legacy flat {ip: expiry}
+            blocks = data
+        state = {}
+        for key, expiry in blocks.items():
+            net = parse_target(key)
+            valid_expiry = expiry is None or (
+                isinstance(expiry, (int, float)) and not isinstance(expiry, bool)
+                and math.isfinite(expiry))
+            if net is None or not valid_expiry:
+                self._log(f"Ignoring invalid state entry {key!r}")
+                continue
+            state[str(net)] = expiry
+        return state
 
     def _save(self, state):
-        tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state), encoding="utf-8")
-        tmp.replace(self.state_file)
+        path = self.state_file
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        payload = json.dumps({"version": 1, "blocks": state}, sort_keys=True)
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(tmp), str(path))
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(str(tmp))
+            raise FirewallError(f"cannot save state file: {exc}") from exc
 
     def _apply_rule(self, target):
         return True if self.dry_run else self._add_rule(target)
@@ -282,60 +470,134 @@ class FirewallManager:
     def _remove_rule(self, target):
         return True if self.dry_run else self._delete_rule(target)
 
-    def _reap(self):
-        state = self._load()
-        now = time.time()
-        expired = [ip for ip, exp in state.items() if exp is not None and exp <= now]
-        for ip in expired:
-            if self._remove_rule(ip):
-                del state[ip]
-                self._log(f"Temporary block expired, unblocked IP {ip}")
-        if expired:
-            self._save(state)
-        return state
+    def _reap_locked(self, state):
+        """Remove expired blocks from *state* and ufw. Returns (removed, failed)."""
+        now = self._clock()
+        expired = [k for k, exp in state.items() if exp is not None and exp <= now]
+        removed = failed = 0
+        for key in expired:
+            if self._remove_rule(key):
+                del state[key]
+                removed += 1
+                self._log(f"Temporary block expired, unblocked {key}")
+            else:
+                failed += 1
+        if removed:
+            try:
+                self._save(state)
+            except FirewallError as exc:
+                self._log(str(exc))
+                failed += removed
+        return removed, failed
 
     # -- public API --------------------------------------------------------
 
+    def _guarded(default):
+        """Public methods never raise: any failure returns *default*."""
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(self, *args, **kwargs):
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    with contextlib.suppress(Exception):
+                        self._log(f"{func.__name__} failed: {exc}")
+                    return default() if callable(default) else default
+            return wrapper
+        return decorator
+
+    def _block(self, ip, duration):
+        net = parse_target(ip)
+        if net is None:
+            self._log(f"Rejected invalid address {ip!r}")
+            return False
+        key = str(net)
+        expiry = None if duration is None else self._clock() + duration
+        with self._locked():
+            state = self._load()
+            self._reap_locked(state)
+            if key in state:
+                old = state[key]
+                new = None if (expiry is None or old is None) else max(old, expiry)
+                if new != old:
+                    state[key] = new
+                    self._save(state)
+                self._log(f"Block already present for {key}")
+                return True
+            if not self._apply_rule(key):
+                return False
+            state[key] = expiry
+            try:
+                self._save(state)
+            except FirewallError as exc:
+                undone = self._remove_rule(key)
+                self._log(f"{exc}; rule for {key} "
+                          f"{'rolled back' if undone else 'COULD NOT BE ROLLED BACK'}")
+                return False
+        if duration is None:
+            self._log(f"Blocked {key}")
+        else:
+            self._log(f"Temporarily blocked {key} for {duration}s")
+        return True
+
+    @_guarded(False)
     def block_ip(self, ip):
-        if not valid_ip(ip):
-            return False
-        state = self._reap()
-        if not self._apply_rule(ip):
-            return False
-        state[ip] = None
-        self._save(state)
-        self._log(f"Blocked IP {ip}")
-        return True
+        return self._block(ip, None)
 
-    def unblock_ip(self, ip):
-        if not valid_ip(ip):
-            return False
-        state = self._reap()
-        if ip not in state:
-            return False
-        if not self._remove_rule(ip):
-            return False
-        del state[ip]
-        self._save(state)
-        self._log(f"Unblocked IP {ip}")
-        return True
-
+    @_guarded(False)
     def temporary_block(self, ip, duration_seconds):
-        if not valid_ip(ip) or duration_seconds <= 0:
+        if (isinstance(duration_seconds, bool)
+                or not isinstance(duration_seconds, (int, float))
+                or not math.isfinite(duration_seconds) or duration_seconds <= 0):
             return False
-        state = self._reap()
-        if not self._apply_rule(ip):
+        return self._block(ip, duration_seconds)
+
+    @_guarded(False)
+    def unblock_ip(self, ip):
+        net = parse_target(ip)
+        if net is None:
             return False
-        state[ip] = time.time() + duration_seconds
-        self._save(state)
-        self._log(f"Temporarily blocked IP {ip} for {duration_seconds}s")
+        key = str(net)
+        with self._locked():
+            state = self._load()
+            self._reap_locked(state)
+            if key not in state:
+                return False
+            if not self._remove_rule(key):
+                return False
+            old = state.pop(key)
+            try:
+                self._save(state)
+            except FirewallError as exc:
+                restored = self._apply_rule(key)
+                self._log(f"{exc}; rule for {key} "
+                          f"{'restored' if restored else 'COULD NOT BE RESTORED'}")
+                return False
+        self._log(f"Unblocked {key}")
         return True
 
+    @_guarded(list)
     def list_blocked(self):
-        return sorted(self._reap())
+        with self._locked():
+            state = self._load()
+            self._reap_locked(state)
+            return sorted(state)
 
+    @_guarded(False)
     def is_blocked(self, ip):
-        return ip in self._reap()
+        net = parse_target(ip)
+        if net is None:
+            return False
+        with self._locked():
+            state = self._load()
+            self._reap_locked(state)
+        for key in state:
+            blocked = ipaddress.ip_network(key)
+            if blocked.version == net.version and net.subnet_of(blocked):
+                return True
+        return False
+
+    del _guarded
 
 
 MENU = """
