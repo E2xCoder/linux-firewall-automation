@@ -45,6 +45,13 @@ def test_ipv6_insert_before_first_v6_rule(make_manager):
     assert any(c[3:5] == ["insert", "2"] for c in ufw.calls)
 
 
+def test_ipv6_prepend_refused_falls_back(make_manager):
+    ufw = FakeUfw(version="0.36.1")
+    ufw.rules = [ufw.rule("1.1.1.1"), ufw.rule("::/0")]
+    assert make_manager(ufw).block_ip(A6)
+    assert [r["target"] for r in ufw.rules] == ["1.1.1.1", C6, "::/0"]
+
+
 def test_ipv6_appended_when_no_v6_rules(make_manager):
     ufw = FakeUfw(version="0.35.0")
     ufw.rules = [ufw.rule("1.1.1.1")]

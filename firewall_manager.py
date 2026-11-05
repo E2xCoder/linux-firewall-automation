@@ -13,6 +13,8 @@ import logging
 import math
 import os
 import re
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -25,6 +27,9 @@ except ImportError:  # pragma: no cover - non-Linux
     fcntl = None
 
 ENV_STATE_DIR = "FIREWALL_AUTOMATION_STATE_DIR"
+ENV_ALLOWLIST = "FIREWALL_AUTOMATION_ALLOWLIST"  # comma-separated IPs/CIDRs
+DEFAULT_MIN_PREFIX_V4 = 16
+DEFAULT_MIN_PREFIX_V6 = 32
 DEFAULT_STATE_SUBDIR = Path(".local") / "state" / "firewall-automation"
 DEFAULT_STATE_NAME = "state.json"
 DEFAULT_LOG_NAME = "firewall.log"
@@ -138,6 +143,18 @@ def valid_ip(ip):
     return parse_target(ip) is not None
 
 
+_NEVER_BLOCK = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/32", "224.0.0.0/4", "240.0.0.0/4", "::/128", "ff00::/8"))
+
+
+def is_special(net):
+    """True for unspecified, multicast or reserved space (overlap, not equality)."""
+    if any(net.version == n.version and net.overlaps(n) for n in _NEVER_BLOCK):
+        return True
+    return any(a.is_unspecified or a.is_multicast or a.is_reserved
+               for a in (net.network_address, net.broadcast_address))
+
+
 def enable_firewall():
     run_command(["sudo", "ufw", "enable"])
     log_action("Firewall enabled")
@@ -233,7 +250,9 @@ class FirewallManager:
     def __init__(self, state_file=None, dry_run=False, runner=None, *,
                  state_dir=None, log_file=None, ufw_path=DEFAULT_UFW_PATH,
                  use_sudo=None, command_timeout=DEFAULT_COMMAND_TIMEOUT,
-                 lock_timeout=DEFAULT_LOCK_TIMEOUT, interactive=False):
+                 lock_timeout=DEFAULT_LOCK_TIMEOUT, interactive=False,
+                 min_prefix_v4=DEFAULT_MIN_PREFIX_V4,
+                 min_prefix_v6=DEFAULT_MIN_PREFIX_V6, allowlist=None):
         self.dry_run = dry_run
         self.ufw_path = ufw_path
         self.command_timeout = command_timeout
@@ -247,6 +266,28 @@ class FirewallManager:
         self._reaper_stop = threading.Event()
         self.state_dir, self.state_file, self.log_file = self._resolve_paths(
             state_dir, state_file, log_file)
+        self.min_prefix_v4 = min_prefix_v4
+        self.min_prefix_v6 = min_prefix_v6
+        self._allowlist = []
+        self._config_error = self._configure_policy(allowlist)
+
+    def _configure_policy(self, allowlist):
+        """Parse policy settings. Returns an error string (all blocks refused)."""
+        for value, top in ((self.min_prefix_v4, 32), (self.min_prefix_v6, 128)):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= top:
+                return f"invalid minimum prefix length {value!r}"
+        try:
+            entries = list(allowlist or [])
+        except TypeError:
+            return "allowlist must be an iterable of IPs/CIDRs"
+        env = os.environ.get(ENV_ALLOWLIST, "")
+        entries += [part.strip() for part in env.split(",") if part.strip()]
+        for entry in entries:
+            net = parse_target(entry)
+            if net is None:
+                return f"invalid allowlist entry {entry!r}"
+            self._allowlist.append(net)
+        return None
 
     @staticmethod
     def _resolve_paths(state_dir, state_file, log_file):
@@ -353,6 +394,144 @@ class FirewallManager:
                 self._log(f"ufw {args[0]} failed")
         return ok, (stdout if isinstance(stdout, str) else "")
 
+    # -- protected addresses ----------------------------------------------
+
+    PROC_ROUTE = "/proc/net/route"
+    PROC_ROUTE6 = "/proc/net/ipv6_route"
+    PROC_IF_INET6 = "/proc/net/if_inet6"
+    PROC_FIB_TRIE = "/proc/net/fib_trie"
+
+    def _gateways(self):
+        """Gateway addresses from /proc. Raises FirewallError if undeterminable."""
+        found = []
+        try:
+            text = Path(self.PROC_ROUTE).read_text()
+        except OSError as exc:
+            raise FirewallError(f"cannot read {self.PROC_ROUTE}: {exc}") from exc
+        for line in text.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            try:
+                gateway, flags = int(fields[2], 16), int(fields[3], 16)
+            except ValueError:
+                continue
+            if gateway and flags & 0x2:  # RTF_GATEWAY
+                found.append(ipaddress.IPv4Address(struct.pack("<L", gateway)))
+        try:
+            text6 = Path(self.PROC_ROUTE6).read_text()
+        except FileNotFoundError:
+            text6 = ""  # IPv6 disabled: no IPv6 gateway exists
+        except OSError as exc:
+            raise FirewallError(f"cannot read {self.PROC_ROUTE6}: {exc}") from exc
+        for line in text6.splitlines():
+            fields = line.split()
+            if len(fields) < 10 or len(fields[4]) != 32:
+                continue
+            try:
+                hop = bytes.fromhex(fields[4])
+            except ValueError:
+                continue
+            if any(hop):
+                found.append(ipaddress.IPv6Address(hop))
+        return found
+
+    @staticmethod
+    def _socket_addresses():
+        """Addresses the resolver and kernel route lookup report for this host."""
+        found = set()
+
+        def add(text):
+            with contextlib.suppress(ValueError):
+                found.add(ipaddress.ip_address(text.split("%")[0]))
+
+        with contextlib.suppress(OSError):
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                add(info[4][0])
+        for family, probe in ((socket.AF_INET, "192.0.2.1"),
+                              (socket.AF_INET6, "2001:db8::1")):
+            with contextlib.suppress(OSError):
+                with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                    sock.connect((probe, 9))  # UDP connect sends nothing
+                    add(sock.getsockname()[0])
+        return found
+
+    def _own_addresses(self):
+        """Best-effort addresses of this host's interfaces."""
+        found = set(self._socket_addresses())
+
+        def add(text):
+            with contextlib.suppress(ValueError):
+                found.add(ipaddress.ip_address(text.split("%")[0]))
+
+        with contextlib.suppress(OSError, ValueError):
+            for line in Path(self.PROC_IF_INET6).read_text().splitlines():
+                found.add(ipaddress.IPv6Address(bytes.fromhex(line.split()[0])))
+        with contextlib.suppress(OSError):
+            last = None
+            for line in Path(self.PROC_FIB_TRIE).read_text().splitlines():
+                text = line.strip()
+                if text.startswith("|--"):
+                    last = text[3:].strip()
+                elif text.startswith("/32 host LOCAL") and last:
+                    add(last)
+        return found
+
+    def _ssh_client(self):
+        raw = os.environ.get("SSH_CONNECTION", "")
+        parts = raw.split()
+        if not parts:
+            if raw.strip():
+                raise FirewallError("SSH_CONNECTION is set but unparseable")
+            return None
+        try:
+            addr = ipaddress.ip_address(parts[0].split("%")[0])
+        except ValueError as exc:
+            raise FirewallError("SSH_CONNECTION is set but unparseable") from exc
+        return addr.ipv4_mapped if getattr(addr, "ipv4_mapped", None) else addr
+
+    def _protected(self):
+        """[(label, network)] that must never be blocked. Raises FirewallError."""
+        items = [("loopback", ipaddress.ip_network("127.0.0.0/8")),
+                 ("loopback", ipaddress.ip_network("::1/128"))]
+        for label, addrs in (("gateway", self._gateways()),
+                             ("own interface address", self._own_addresses()),
+                             ("SSH client", [self._ssh_client()])):
+            for addr in addrs:
+                if addr is not None:
+                    items.append((label, ipaddress.ip_network(addr)))
+        items += [("allowlist", net) for net in self._allowlist]
+        return items
+
+    def _check_target(self, ip):
+        """Validated canonical network to block, or None (reason is logged)."""
+        net = parse_target(ip)
+        if net is None:
+            self._log(f"Rejected invalid address {ip!r}")
+            return None
+        if self._config_error:
+            self._log(f"Refusing to block {net}: {self._config_error}")
+            return None
+        minimum = self.min_prefix_v4 if net.version == 4 else self.min_prefix_v6
+        if net.prefixlen < minimum:
+            self._log(f"Refusing {net}: prefix /{net.prefixlen} is broader than "
+                      f"the allowed minimum /{minimum}")
+            return None
+        if is_special(net):
+            self._log(f"Refusing {net}: unspecified, multicast or reserved range")
+            return None
+        try:
+            protected = self._protected()
+        except FirewallError as exc:
+            self._log(f"Refusing {net}: cannot verify protected addresses "
+                      f"({exc}); failing closed")
+            return None
+        for label, other in protected:
+            if other.version == net.version and net.overlaps(other):
+                self._log(f"Refusing {net}: overlaps {label} {other}")
+                return None
+        return net
+
     # -- ufw probes --------------------------------------------------------
 
     def _status(self):
@@ -395,11 +574,12 @@ class FirewallManager:
         if not rules:
             return self._exec("deny", "from", target)[0]
         if self._supports_prepend():
-            return self._exec("prepend", "deny", "from", target)[0]
-        if self._exec("insert", "1", "deny", "from", target)[0]:
+            first = self._exec("prepend", "deny", "from", target)[0]
+        else:
+            first = self._exec("insert", "1", "deny", "from", target)[0]
+        if first:
             return True
-        is_v6 = ":" in target
-        if not is_v6:
+        if ":" not in target:
             return False
         # ufw refuses an IPv6 rule ahead of IPv4 rules: go before the first
         # IPv6 rule, or append when there is none (then nothing precedes it).
@@ -507,9 +687,8 @@ class FirewallManager:
         return decorator
 
     def _block(self, ip, duration):
-        net = parse_target(ip)
+        net = self._check_target(ip)
         if net is None:
-            self._log(f"Rejected invalid address {ip!r}")
             return False
         key = str(net)
         expiry = None if duration is None else self._clock() + duration

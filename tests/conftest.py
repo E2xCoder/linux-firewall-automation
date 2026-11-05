@@ -98,6 +98,38 @@ class FakeUfw:
         return fm.CommandResult(False, "", "ERROR: unsupported in fake")
 
 
+ROUTE = (
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+    "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+)
+ROUTE6 = ("00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+          "fe800000000000000000000000000001 00000064 00000001 00000000 00000003 eth0\n")
+IF_INET6 = "20010db8000000000000000000000050 02 40 00 80 eth0\n"
+FIB_TRIE = (
+    "Main:\n  +-- 192.168.1.0/24 2 0 2\n     |-- 192.168.1.0\n        /24 link UNICAST\n"
+    "     |-- 192.168.1.50\n        /32 host LOCAL\n"
+)
+# gateway 192.168.1.1, fe80::1; own 192.168.1.50, 2001:db8::50
+
+
+@pytest.fixture(autouse=True)
+def fake_host(tmp_path, monkeypatch):
+    """Point every host probe at fixture files: no real /proc, DNS or env."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    files = {"PROC_ROUTE": ("route", ROUTE), "PROC_ROUTE6": ("ipv6_route", ROUTE6),
+             "PROC_IF_INET6": ("if_inet6", IF_INET6), "PROC_FIB_TRIE": ("fib_trie", FIB_TRIE)}
+    for attr, (name, text) in files.items():
+        (proc / name).write_text(text)
+        monkeypatch.setattr(fm.FirewallManager, attr, str(proc / name))
+    monkeypatch.setattr(fm.FirewallManager, "_socket_addresses",
+                        staticmethod(lambda: set()))
+    for var in ("SSH_CONNECTION", fm.ENV_ALLOWLIST, fm.ENV_STATE_DIR):
+        monkeypatch.delenv(var, raising=False)
+    return proc
+
+
 @pytest.fixture
 def ufw():
     return FakeUfw()
